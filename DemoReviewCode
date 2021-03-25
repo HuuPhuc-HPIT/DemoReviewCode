@@ -197,8 +197,6 @@ class EbayCrawlerWithHobbyco extends Crawler {
             setTimeout(resolve, ms);
         });
     } 
-
-
 }
 
 module.exports = EbayCrawlerWithHobbyco;
