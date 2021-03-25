@@ -1,0 +1,204 @@
+const fs = require('fs');
+const JSONStream = require('JSONStream');
+const es = require('event-stream');
+const _ = require('lodash');
+const Crawler = require('../services/Crawler');
+const File = require('../services/File');
+const KoganAPI  = require('../services/KoganAPI');
+const moment = require("moment");
+
+class EbayCrawlerWithHobbyco extends Crawler {
+    constructor() {
+        super();
+        this.fileInstance = new File();
+        this.crawlerInstance = new Crawler();
+        this.koganApiInstance = new KoganAPI();
+        this.streamFilePath = './tmp/jsonStream.json';
+        this.itemPerBlock = 3000;
+        this.waitPerBlock = 30000;
+    }
+
+    /**
+     * Start crawl process
+     * Params: File path
+     * Return: Result true || false
+     */
+    async startProcess(filePath) {
+        // Get data from file
+        const getFileData = await this.fileInstance.getDataFromExcelFile(filePath);
+        // Create JSON stream file
+        this.createFileStream(getFileData);
+        // Stream JSON file
+        this.streamJSONFile(this.streamFilePath);
+        // Loop array - Verify - Crawl
+        const dataCrawled = await this.streamDATA();
+        // Post product on Kogan
+        const listPendingUrl = await this.postProductKogan(dataCrawled);
+        // create file task
+        if (!!listPendingUrl) await this.createFileTask(listPendingUrl);
+    }
+
+    /**
+     * Post product on kogan
+     * Params: data crawl
+     * Return: List pending url
+     */
+    async postProductKogan(dataCrawled) {
+        let listPendingUrl = [];
+        const dataFilterSku = _.filter(dataCrawled, function(o) {
+            return !!o.product_sku;
+        });
+        console.log("POST PRODUCT ON KOGAN...");
+        const postProduct = await this.koganApiInstance.postProduct(dataFilterSku);
+        if (postProduct.pending_url) listPendingUrl.push(postProduct.pending_url);
+        console.log(postProduct);
+        return listPendingUrl;
+    }
+
+    /**
+     * Create file task
+     * param: data
+     * return file
+     */
+    async createFileTask(data) {
+        console.log("CREATE FILE TASK...");
+        const fileName = 'task-' +  moment().format('YYYY-MM-DD-HH-mm-ss') + '.json';
+        fs.writeFile('./storage/koganPendingUrl/' + fileName, JSON.stringify(data), 'utf8', (err) => {
+            if (err) return;
+        });
+    }
+
+     /**
+     * Start crawl data
+     * Params: itemID
+     * Return: Data is crawled
+     */
+    async crawlData(itemID, description, image, stock, offer, category) {
+        return new Promise(async (resolve, reject) => {
+            await this.crawlerInstance.getDataEbayAPI(itemID, async function (error, results) {
+                if (results) {
+                    let item = results.Item;
+                    if (!item) resolve(null);
+                    if (item) {
+                        console.log(item);
+                        const sku = item.SKU;
+                        const category = item.PrimaryCategory.CategoryName;
+                        const title = item.Title;
+                        const upc = item.ProductListingDetails.UPC;
+                        const brand = item.ProductListingDetails.BrandMPN.Brand;
+                        const price = item.StartPrice.amount;
+                        resolve({
+                            product_sku: sku,
+                            category: category,
+                            product_title: title,
+                            product_description: description,
+                            brand,
+                            price,
+                            upc,
+                            images: image,
+                            stock,
+                            offer_data: offer
+                        })
+                    }
+                } else {
+                    reject(JSON.stringify(error));
+                }
+            })
+        })
+    }
+
+    /**
+     * Create tmp file
+     * param: object
+     * return file
+     */
+    createFileStream(data) {
+        if (fs.existsSync(this.streamFilePath)) fs.unlinkSync(this.streamFilePath);
+        console.log("CREATE TMP JSON...");
+        fs.writeFile(this.streamFilePath, JSON.stringify(data), 'utf8', (err) => {
+            if (err) return;
+        });
+    }
+
+    /**
+     * stream file
+     * return stream pipe
+     */
+    streamJSONFile() {
+        console.log("CREATE TMP JSON SUCCESS...");
+        const readStream = fs.createReadStream(this.streamFilePath, { encoding: 'utf8' });
+        const parser = JSONStream.parse('data');
+        console.log("PREPARE STREAM SUCCESS...");
+        return readStream.pipe(parser);
+    }
+
+    /**
+     * stream data
+     * return crawler content
+     */
+    async streamDATA() {
+        const crawContent = [];
+        return new Promise((resolve, reject) => {
+            const stream = this.streamJSONFile()
+            .pipe(
+                es.through(
+                    async (data) => {
+                        let count = 0;
+                        let validData = 0;
+                        console.log("BEGIN STREAM...Total", data.length);
+                        this.asyncForEach(data, async (row, index) => {
+                            console.log("READ ROW...", index);
+                            console.log("FOUND ROW...", index);
+                            const productID = row.AK;
+                            const description = row.K;
+                            const image = row.W;
+                            const stock = row.H;
+                            const offer = 'No offer data';
+                            const category = "Collectables";
+                            if (productID && productID !== 'NO EBAY COMPETITOR') {
+                                try {
+                                    const resolveProductID = _.first(_.last(productID.split('/')).split('?'));
+                                    const dataCrawled = await this.crawlData(resolveProductID, description, image, stock, offer, category);
+                                    if (dataCrawled) {
+                                        console.log("GET PRODUCT DATA OF", resolveProductID, "SUCCESS...");
+                                        crawContent.push(dataCrawled);
+                                        validData += 1;
+                                    }
+                                }
+                                catch (err) {
+                                    console.log("ERROR WHILE CRAWLED..." , err)
+                                }
+                            }
+                            count += 1;
+                            if (count === data.length) {
+                                console.log("VALID DATA: ", validData);
+                                console.log("END STREAM...");
+                                fs.unlinkSync(this.streamFilePath);
+                                resolve(crawContent);
+                            }
+                        });
+                    },
+                    function() {
+                        stream.emit('end');
+                    }
+                )
+            );
+        });
+    }
+
+    async asyncForEach(array, callback) {
+        for (let index = 0; index < array.length; index++) {
+            await callback(array[index], index, array);
+        }
+    }
+
+    sleep(ms) {
+        return new Promise((resolve) => {
+            setTimeout(resolve, ms);
+        });
+    } 
+
+
+}
+
+module.exports = EbayCrawlerWithHobbyco;
